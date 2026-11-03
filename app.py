@@ -1,14 +1,12 @@
 import streamlit as st
 import os
 import csv
+import io
 from datetime import datetime
 from openai import OpenAI
 
-if "ready_to_download" not in st.session_state:
-    st.session_state.ready_to_download = False
-
 # ==========================================
-#  配置区
+# 1. 配置区
 # ==========================================
 # 从 Streamlit Secrets 读取，本地测试可用环境变量
 API_KEY = st.secrets.get("API_KEY", os.environ.get("API_KEY", ""))
@@ -22,7 +20,7 @@ MODEL_NAME = "deepseek-chat"
 # MODEL_NAME = "qwen-plus"
 
 # 实验组学号列表
-EXPERIMENTAL_GROUP = ["11", "", ""]
+EXPERIMENTAL_GROUP = ["11", "", ""] 
 
 # 系统提示词
 SYSTEM_PROMPT_EXPERIMENTAL = """你是一个学习引导助手。你的任务不是直接给学生答案，而是引导他们深入思考。
@@ -47,12 +45,12 @@ SYSTEM_PROMPT_EXPERIMENTAL = """你是一个学习引导助手。你的任务不
 
 SYSTEM_PROMPT_CONTROL = """你是一个学习助手。学生会在任务中向你提问，请你直接、准确地回答问题，协助他们完成任务。不要主动追问学生的感受或反思。"""
 
-# 日志文件路径（Streamlit Cloud 重启可能丢失，建议学生用下载按钮备份）
+# 日志文件路径（仅供后台日志记录，学生端通过按钮下载）
 LOG_FILE = "experiment_log.csv"
 
 
 # ==========================================
-# 工具函数
+# 2. 工具函数
 # ==========================================
 def get_group(student_id):
     """根据学号判断组别"""
@@ -84,7 +82,6 @@ def log_message(student_id, group, task_round, role, content):
                 content
             ])
     except Exception as e:
-        # 不中断实验，只在页面角落提示
         st.toast(f"⚠️ 日志写入失败：{e}")
 
 
@@ -105,16 +102,19 @@ def call_llm(messages, system_prompt):
 
 
 def export_current_chat():
-    """把当前会话消息导出为 CSV 字符串（供下载）"""
-    rows = [["角色", "内容"]]
+    """把当前会话消息导出为带 BOM 的标准 CSV，解决 Excel 乱码和列错位"""
+    output = io.StringIO()
+    # quoting=csv.QUOTE_ALL 确保内容里有逗号也不会错列
+    writer = csv.writer(output, quoting=csv.QUOTE_ALL) 
+    writer.writerow(["角色", "内容"])
     for msg in st.session_state.messages:
-        rows.append([msg["role"], msg["content"]])
-    csv_str = "\n".join([",".join([f'"{c}"' for c in row]) for row in rows])
-    return csv_str
+        writer.writerow([msg["role"], msg["content"]])
+    # 返回带有 BOM 头的字节流，让 Excel 双击直接完美识别中文
+    return output.getvalue().encode('utf-8-sig')
 
 
 # ==========================================
-# 页面配置与初始化
+# 3. 页面配置与初始化
 # ==========================================
 st.set_page_config(page_title="学习助手", page_icon="🤖", layout="centered")
 init_log()
@@ -133,10 +133,12 @@ if "task_round" not in st.session_state:
     st.session_state.task_round = 1
 if "round_archived" not in st.session_state:
     st.session_state.round_archived = False
+if "ready_to_download" not in st.session_state:
+    st.session_state.ready_to_download = False
 
 
 # ==========================================
-# 登录界面
+# 4. 登录界面
 # ==========================================
 if st.session_state.student_id is None:
     with st.form("login_form"):
@@ -150,7 +152,7 @@ if st.session_state.student_id is None:
 
 
 # ==========================================
-# 主界面（已登录）
+# 5. 主界面（已登录）
 # ==========================================
 group = st.session_state.group
 
@@ -175,6 +177,7 @@ with st.sidebar:
         st.session_state.task_round = task_round
         st.session_state.messages = []
         st.session_state.round_archived = False
+        st.session_state.ready_to_download = False
         st.rerun()
 
     st.divider()
@@ -182,27 +185,27 @@ with st.sidebar:
     if st.button("🔄 结束本轮并清空对话"):
         st.session_state.messages = []
         st.session_state.round_archived = False
+        st.session_state.ready_to_download = False
         st.success("已清空当前对话，可开始新一轮。")
         st.rerun()
 
-   # 先放一个普通按钮，点击后设置标记
+    # 先放一个普通按钮，点击后设置标记
     if st.button("📥 下载本次对话记录"):
         st.session_state.ready_to_download = True
 
     # 只有标记被触发后，才渲染真正的下载按钮
-    # 此时 session_state.messages 已经包含全部完整对话
     if st.session_state.get("ready_to_download", False) and st.session_state.messages:
         st.download_button(
             label="✅ 点击保存 CSV 文件",
             data=export_current_chat(),
             file_name=f"{st.session_state.student_id}_第{st.session_state.task_round}次任务.csv",
             mime="text/csv",
-            key="final_download"  # 给一个固定 key，避免重复渲染冲突
+            key="final_download"
         )
         st.caption("下载完成后，可继续对话或切换任务轮次。")
 
     st.divider()
-    st.caption("提示：完成一次任务后，请在左侧切换到下一轮。")
+    st.caption("提示：完成一次任务后，请先下载记录，再切换下一轮。")
 
 
 # 主区域
@@ -219,9 +222,6 @@ if prompt := st.chat_input("输入你的消息..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     log_message(st.session_state.student_id, group, st.session_state.task_round, "user", prompt)
 
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
     # 2. 选择系统提示词
     if group == "实验组":
         system_prompt = SYSTEM_PROMPT_EXPERIMENTAL
@@ -236,11 +236,10 @@ if prompt := st.chat_input("输入你的消息..."):
             response = f"⚠️ 调用失败，请检查网络或联系管理员。\n\n错误信息：{str(e)}"
             st.error(response)
 
-    # 4. 记录并显示 AI 回复
+    # 4. 记录 AI 回复
     st.session_state.messages.append({"role": "assistant", "content": response})
     log_message(st.session_state.student_id, group, st.session_state.task_round, "assistant", response)
-
-    with st.chat_message("assistant"):
-        st.markdown(response)
-    # AI 回复已追加到 messages 后
-    st.session_state.ready_to_download = False  # 新消息产生，旧的下载准备作废
+    
+    # 5. 重置下载状态，并强制重跑页面，确保下载按钮拿到完整的最新对话
+    st.session_state.ready_to_download = False  
+    st.rerun() 
