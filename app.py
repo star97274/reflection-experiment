@@ -4,6 +4,9 @@ import csv
 from datetime import datetime
 from openai import OpenAI
 
+if "ready_to_download" not in st.session_state:
+    st.session_state.ready_to_download = False
+
 # ==========================================
 #  配置区
 # ==========================================
@@ -151,7 +154,7 @@ if st.session_state.student_id is None:
 # ==========================================
 group = st.session_state.group
 
-# 侧边栏：显示信息 + 操作按钮
+# 侧边栏：显示信息和操作按钮
 with st.sidebar:
     st.header("📋 实验信息")
     st.write(f"**学号**：{st.session_state.student_id}")
@@ -182,14 +185,21 @@ with st.sidebar:
         st.success("已清空当前对话，可开始新一轮。")
         st.rerun()
 
-    # 导出当前对话
-    if st.session_state.messages:
+   # 先放一个普通按钮，点击后设置标记
+    if st.button("📥 下载本次对话记录"):
+        st.session_state.ready_to_download = True
+
+    # 只有标记被触发后，才渲染真正的下载按钮
+    # 此时 session_state.messages 已经包含全部完整对话
+    if st.session_state.get("ready_to_download", False) and st.session_state.messages:
         st.download_button(
-            label="📥 下载本次对话记录",
+            label="✅ 点击保存 CSV 文件",
             data=export_current_chat(),
             file_name=f"{st.session_state.student_id}_第{st.session_state.task_round}次任务.csv",
-            mime="text/csv"
+            mime="text/csv",
+            key="final_download"  # 给一个固定 key，避免重复渲染冲突
         )
+        st.caption("下载完成后，可继续对话或切换任务轮次。")
 
     st.divider()
     st.caption("提示：完成一次任务后，请在左侧切换到下一轮。")
@@ -232,3 +242,5 @@ if prompt := st.chat_input("输入你的消息..."):
 
     with st.chat_message("assistant"):
         st.markdown(response)
+    # AI 回复已追加到 messages 后
+    st.session_state.ready_to_download = False  # 新消息产生，旧的下载准备作废
