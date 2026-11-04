@@ -2,20 +2,22 @@ import streamlit as st
 import os
 import csv
 import io
-import time
-import requests
 from datetime import datetime
 from openai import OpenAI
 
 # ==========================================
 # 1. 配置区
 # ==========================================
-# 读取环境变量/Secrets
+# 从 Streamlit Secrets 读取，本地测试可用环境变量
 API_KEY = st.secrets.get("API_KEY", os.environ.get("API_KEY", ""))
 
-# 大模型配置
+# 模型配置（deepseek）
 BASE_URL = "https://api.deepseek.com"
 MODEL_NAME = "deepseek-chat"
+
+# 千问配置
+# BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+# MODEL_NAME = "qwen-plus"
 
 # 实验组学号列表
 EXPERIMENTAL_GROUP = ["11", "", ""] 
@@ -43,150 +45,52 @@ SYSTEM_PROMPT_EXPERIMENTAL = """你是一个学习引导助手。你的任务不
 
 SYSTEM_PROMPT_CONTROL = """你是一个学习助手。学生会在任务中向你提问，请你直接、准确地回答问题，协助他们完成任务。不要主动追问学生的感受或反思。"""
 
-# ==========================================
-# 2. 飞书 API 工具函数
-# ==========================================
-def get_feishu_token():
-    """获取并缓存飞书 token，防止触发限流"""
-    if "feishu_token" in st.session_state and st.session_state.get("feishu_token_expire", 0) > time.time():
-        return st.session_state["feishu_token"]
-    
-    url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-    payload = {
-        "app_id": st.secrets["FEISHU_APP_ID"],
-        "app_secret": st.secrets["FEISHU_APP_SECRET"]
-    }
-    try:
-        resp = requests.post(url, json=payload).json()
-        token = resp.get("tenant_access_token")
-        expire = resp.get("expire", 7200)
-        
-        # 提前 5 分钟过期，保证绝对安全
-        st.session_state["feishu_token"] = token
-        st.session_state["feishu_token_expire"] = time.time() + expire - 300
-        return token
-    except Exception as e:
-        st.error(f"飞书鉴权失败，请检查 Secrets 配置: {e}")
-        return None
+# 日志文件路径（仅供后台日志记录，学生端通过按钮下载）
+LOG_FILE = "experiment_log.csv"
 
-def feishu_get_student_records(student_id, task_round=None):
-    """从飞书拉取该学生的历史记录，按时间正序返回"""
-    token = get_feishu_token()
-    if not token: return []
-    
-    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{st.secrets['FEISHU_APP_TOKEN']}/tables/{st.secrets['FEISHU_TABLE_ID']}/records/search"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    
-    conditions = [{"field_name": "学号", "operator": "is", "value": [student_id]}]
-    if task_round:
-        conditions.append({"field_name": "任务轮次", "operator": "is", "value": [str(task_round)]})
-    
-    payload = {
-        "filter": {"conjunction": "and", "conditions": conditions},
-        "page_size": 500,
-        "sort": [{"field_name": "时间戳", "desc": False}] # 按时间正序
-    }
-    
-    all_messages = []
-    while True:
+
+# ==========================================
+# 2. 工具函数
+# ==========================================
+def get_group(student_id):
+    """根据学号判断组别"""
+    return "实验组" if student_id in EXPERIMENTAL_GROUP else "对照组"
+
+
+def init_log():
+    """初始化日志文件（含表头）"""
+    if not os.path.exists(LOG_FILE):
         try:
-            resp = requests.post(url, headers=headers, json=payload).json()
-            data = resp.get("data", {})
-            items = data.get("items", [])
-            
-            for item in items:
-                f = item.get("fields", {})
-                role = f.get("角色")
-                content = f.get("内容")
-                # 飞书有时会把多行文本包装成 list，这里做兼容处理
-                if isinstance(role, list) and role: role = role[0].get("text", "")
-                if isinstance(content, list) and content: content = content[0].get("text", "")
-                
-                if role and content:
-                    all_messages.append({"role": str(role), "content": str(content)})
-                    
-            if not data.get("has_more"):
-                break
-            payload["page_token"] = data.get("page_token")
+            with open(LOG_FILE, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["时间戳", "学号", "组别", "任务轮次", "角色", "内容"])
         except Exception as e:
-            st.toast(f"拉取历史记录失败: {e}")
-            break
-            
-    return all_messages
+            st.error(f"日志文件初始化失败：{e}")
 
-def feishu_add_record(student_id, group, task_round, role, content):
-    """向飞书多维表格追加一条消息"""
-    token = get_feishu_token()
-    if not token: return
-    
-    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{st.secrets['FEISHU_APP_TOKEN']}/tables/{st.secrets['FEISHU_TABLE_ID']}/records"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    
-    payload = {
-        "fields": {
-            "学号": str(student_id),
-            "组别": str(group),
-            "任务轮次": str(task_round),
-            "角色": str(role),
-            "内容": str(content),
-            "时间戳": int(time.time() * 1000) # 存入毫秒级时间戳
-        }
-    }
+
+def log_message(student_id, group, task_round, role, content):
+    """追加一条消息到日志，带异常捕获防止并发写崩"""
     try:
-        resp = requests.post(url, headers=headers, json=payload)
-        if resp.status_code != 200:
-            st.toast(f"⚠️ 飞书同步失败: {resp.text}")
+        with open(LOG_FILE, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                datetime.now().isoformat(),
+                student_id,
+                group,
+                task_round,
+                role,
+                content
+            ])
     except Exception as e:
-        st.toast(f"⚠️ 网络异常，飞书同步失败: {e}")
-
-def feishu_download_all_as_csv():
-    """拉取飞书全部记录，生成 CSV（供研究者下载）"""
-    token = get_feishu_token()
-    if not token: return b""
-    
-    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{st.secrets['FEISHU_APP_TOKEN']}/tables/{st.secrets['FEISHU_TABLE_ID']}/records/search"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    
-    all_items = []
-    page_token = None
-    while True:
-        payload = {"page_size": 500}
-        if page_token: payload["page_token"] = page_token
-        
-        try:
-            resp = requests.post(url, headers=headers, json=payload).json()
-            data = resp.get("data", {})
-            all_items.extend(data.get("items", []))
-            if not data.get("has_more"): break
-            page_token = data.get("page_token")
-        except Exception:
-            break
-
-    output = io.StringIO()
-    writer = csv.writer(output, quoting=csv.QUOTE_ALL)
-    writer.writerow(["时间戳", "学号", "组别", "任务轮次", "角色", "内容"])
-    
-    for item in all_items:
-        f = item.get("fields", {})
-        # 兼容飞书返回的列表格式
-        row = []
-        for key in ["时间戳", "学号", "组别", "任务轮次", "角色", "内容"]:
-            val = f.get(key, "")
-            if isinstance(val, list) and val: val = val[0].get("text", "")
-            row.append(val)
-        writer.writerow(row)
-        
-    return output.getvalue().encode('utf-8-sig')
+        st.toast(f"⚠️ 日志写入失败：{e}")
 
 
-# ==========================================
-# 3. 大模型调用工具
-# ==========================================
 def call_llm(messages, system_prompt):
+    """调用大模型 API，带超时和异常处理"""
     client = OpenAI(
         api_key=API_KEY,
         base_url=BASE_URL,
-        timeout=60.0
+        timeout=60.0  # 60 秒超时
     )
     full_messages = [{"role": "system", "content": system_prompt}] + messages
     response = client.chat.completions.create(
@@ -197,13 +101,28 @@ def call_llm(messages, system_prompt):
     return response.choices[0].message.content
 
 
+def export_current_chat():
+    """把当前会话消息导出为带 BOM 的标准 CSV，解决 Excel 乱码和列错位"""
+    output = io.StringIO()
+    # quoting=csv.QUOTE_ALL 确保内容里有逗号也不会错列
+    writer = csv.writer(output, quoting=csv.QUOTE_ALL) 
+    writer.writerow(["角色", "内容"])
+    for msg in st.session_state.messages:
+        writer.writerow([msg["role"], msg["content"]])
+    # 返回带有 BOM 头的字节流，让 Excel 双击直接完美识别中文
+    return output.getvalue().encode('utf-8-sig')
+
+
 # ==========================================
-# 4. 页面配置与初始化
+# 3. 页面配置与初始化
 # ==========================================
 st.set_page_config(page_title="学习助手", page_icon="🤖", layout="centered")
+init_log()
+
 st.title("🤖 学习助手")
 st.caption("请在下方输入学号开始使用")
 
+# 会话状态初始化
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "student_id" not in st.session_state:
@@ -212,9 +131,14 @@ if "group" not in st.session_state:
     st.session_state.group = None
 if "task_round" not in st.session_state:
     st.session_state.task_round = 1
+if "round_archived" not in st.session_state:
+    st.session_state.round_archived = False
+if "ready_to_download" not in st.session_state:
+    st.session_state.ready_to_download = False
+
 
 # ==========================================
-# 5. 登录界面
+# 4. 登录界面
 # ==========================================
 if st.session_state.student_id is None:
     with st.form("login_form"):
@@ -222,24 +146,22 @@ if st.session_state.student_id is None:
         submitted = st.form_submit_button("开始")
         if submitted and student_id.strip():
             st.session_state.student_id = student_id.strip()
-            st.session_state.group = "实验组" if st.session_state.student_id in EXPERIMENTAL_GROUP else "对照组"
-            # 从飞书加载历史
-            with st.spinner("正在加载历史记录..."):
-                st.session_state.messages = feishu_get_student_records(
-                    st.session_state.student_id, st.session_state.task_round
-                )
+            st.session_state.group = get_group(st.session_state.student_id)
             st.rerun()
-    st.stop()
+    st.stop()  # 未登录时不再往下执行
+
 
 # ==========================================
-# 6. 主界面（已登录）
+# 5. 主界面（已登录）
 # ==========================================
 group = st.session_state.group
 
+# 侧边栏：显示信息和操作按钮
 with st.sidebar:
     st.header("📋 实验信息")
     st.write(f"**学号**：{st.session_state.student_id}")
-    
+    # st.write(f"**组别**：{group}")
+
     st.divider()
     st.subheader("任务轮次")
     task_round = st.selectbox(
@@ -250,32 +172,41 @@ with st.sidebar:
         key="task_selector"
     )
 
-    # 切换轮次时，重新从飞书拉取对应轮次的历史
+    # 如果切换了轮次，清空对话，开始新一轮
     if task_round != st.session_state.task_round:
         st.session_state.task_round = task_round
-        with st.spinner("切换任务，加载记录..."):
-            st.session_state.messages = feishu_get_student_records(
-                st.session_state.student_id, st.session_state.task_round
-            )
+        st.session_state.messages = []
+        st.session_state.round_archived = False
+        st.session_state.ready_to_download = False
         st.rerun()
 
     st.divider()
     st.subheader("操作")
-    if st.button("🔄 清空当前页面显示"):
+    if st.button("🔄 结束本轮并清空对话"):
         st.session_state.messages = []
+        st.session_state.round_archived = False
+        st.session_state.ready_to_download = False
+        st.success("已清空当前对话，可开始新一轮。")
         st.rerun()
 
+    # 先放一个普通按钮，点击后设置标记
+    if st.button("📥 下载本次对话记录"):
+        st.session_state.ready_to_download = True
+
+    # 只有标记被触发后，才渲染真正的下载按钮
+    if st.session_state.get("ready_to_download", False) and st.session_state.messages:
+        st.download_button(
+            label="✅ 点击保存 CSV 文件",
+            data=export_current_chat(),
+            file_name=f"{st.session_state.student_id}_第{st.session_state.task_round}次任务.csv",
+            mime="text/csv",
+            key="final_download"
+        )
+        st.caption("下载完成后，可继续对话或切换任务轮次。")
+
     st.divider()
-    st.subheader("🔧 研究者工具")
-    if st.button("📥 下载全部实验记录 (CSV)"):
-        with st.spinner("正在从飞书提取所有数据..."):
-            csv_data = feishu_download_all_as_csv()
-            st.download_button(
-                label="✅ 点击保存",
-                data=csv_data,
-                file_name=f"全部实验记录_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv"
-            )
+    st.caption("提示：完成一次任务后，请先下载记录，再切换下一轮。")
+
 
 # 主区域
 st.success(f"已登录，学号：{st.session_state.student_id}｜当前：第 {st.session_state.task_round} 次任务")
@@ -285,29 +216,30 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# 对话输入
+# 输入框
 if prompt := st.chat_input("输入你的消息..."):
-    # 1. 显示并同步用户消息到飞书
+    # 1. 记录并显示用户消息
     st.session_state.messages.append({"role": "user", "content": prompt})
-    feishu_add_record(st.session_state.student_id, group, st.session_state.task_round, "user", prompt)
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    log_message(st.session_state.student_id, group, st.session_state.task_round, "user", prompt)
 
-    # 2. 选择提示词
-    system_prompt = SYSTEM_PROMPT_EXPERIMENTAL if group == "实验组" else SYSTEM_PROMPT_CONTROL
+    # 2. 选择系统提示词
+    if group == "实验组":
+        system_prompt = SYSTEM_PROMPT_EXPERIMENTAL
+    else:
+        system_prompt = SYSTEM_PROMPT_CONTROL
 
-    # 3. 调用大模型
+    # 3. 调用 API（传入完整历史，修复丢消息 bug）
     with st.spinner("思考中..."):
         try:
             response = call_llm(st.session_state.messages, system_prompt)
         except Exception as e:
-            response = f"⚠️ 调用失败：{str(e)}"
+            response = f"⚠️ 调用失败，请检查网络或联系管理员。\n\n错误信息：{str(e)}"
             st.error(response)
 
-    # 4. 显示并同步 AI 回复到飞书
+    # 4. 记录 AI 回复
     st.session_state.messages.append({"role": "assistant", "content": response})
-    feishu_add_record(st.session_state.student_id, group, st.session_state.task_round, "assistant", response)
-    with st.chat_message("assistant"):
-        st.markdown(response)
-        
-    st.rerun()
+    log_message(st.session_state.student_id, group, st.session_state.task_round, "assistant", response)
+    
+    # 5. 重置下载状态，并强制重跑页面，确保下载按钮拿到完整的最新对话
+    st.session_state.ready_to_download = False  
+    st.rerun() 
